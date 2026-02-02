@@ -109,6 +109,7 @@ export function isVPNStatus(value: unknown): value is VPNStatus {
     value === "connecting" ||
     value === "handshaking" ||
     value === "connected" ||
+    value === "proxy_error" ||
     value === "error"
   );
 }

@@ -318,7 +318,10 @@ export const useVPNEvents = () => {
         }
 
         const vpnState = useVPNStore.getState();
-        if (vpnState.vpnStatus !== "connected") {
+        if (
+          vpnState.vpnStatus !== "connected" &&
+          vpnState.vpnStatus !== "proxy_error"
+        ) {
           return;
         }
 

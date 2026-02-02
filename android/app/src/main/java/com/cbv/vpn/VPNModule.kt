@@ -860,29 +860,92 @@ class VPNModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-fun checkProxyHealth(
-    type: String,
-    host: String,
-    port: Int,
-    username: String,
-    password: String,
-    promise: Promise
-) {
-    // Run in background thread to avoid blocking UI
-    Thread {
-        try {
-            Log.d("HealthCheck", "🏥 Starting health check for $type proxy $host:$port")
-            val start = System.nanoTime()
-            val socket = java.net.Socket()
-            
-            // Set timeouts for health check (5 seconds)
-            socket.soTimeout = 5_000
-            
-            val isHttp = type.equals("http", ignoreCase = true)
-            
-            // Choose handler based on type
-            // For HTTP: connectHttpQuick sends GET request directly through proxy
-            // For SOCKS5: connectSocks5Quick establishes tunnel, then we send GET request
+	fun checkProxyHealth(
+	    type: String,
+	    host: String,
+	    port: Int,
+	    username: String,
+	    password: String,
+	    promise: Promise
+	) {
+	    // Run in background thread to avoid blocking UI
+	    Thread {
+	        try {
+	            Log.d("HealthCheck", "🏥 Starting health check for $type proxy $host:$port")
+	            val start = System.nanoTime()
+	            val isHttp = type.equals("http", ignoreCase = true)
+
+	            // For HTTP proxies, prefer a CONNECT-based probe first.
+	            // Many HTTP proxies (especially "HTTPS proxies") work fine for CONNECT (443) but may block
+	            // plain HTTP (80) requests to specific endpoints (e.g., ip-api.com), causing false negatives.
+	            if (isHttp) {
+	                val probeSocket = java.net.Socket()
+	                try {
+	                    // Keep the probe very fast to avoid UI delays.
+	                    probeSocket.soTimeout = 3_000
+
+	                    val (statusCode, statusLine) =
+	                            connectHttpConnectProbe(
+	                                    probeSocket,
+	                                    host,
+	                                    port,
+	                                    if (username.isBlank()) null else username.trim(),
+	                                    if (password.isBlank()) null else password.trim(),
+	                                    targetHost = "api.ipify.org",
+	                                    targetPort = 443
+	                            )
+
+	                    val latencyMs = ((System.nanoTime() - start) / 1_000_000L).toInt()
+
+	                    if (statusCode == 200) {
+	                        val result = Arguments.createMap()
+	                        result.putBoolean("ok", true)
+	                        result.putInt("latencyMs", latencyMs)
+	                        result.putString("method", "http_connect")
+	                        result.putString("details", statusLine ?: "HTTP CONNECT 200")
+	                        Log.d("HealthCheck", "✅ HTTP CONNECT probe PASSED: ${statusLine ?: "200"}")
+	                        promise.resolve(result)
+	                        return@Thread
+	                    }
+
+	                    if (statusCode == 407) {
+	                        val result = Arguments.createMap()
+	                        result.putBoolean("ok", false)
+	                        result.putInt("latencyMs", latencyMs)
+	                        result.putString(
+	                                "error",
+	                                "Proxy authentication required (407). ${statusLine ?: ""}".trim()
+	                        )
+	                        Log.e("HealthCheck", "❌ HTTP CONNECT probe FAILED (407): $statusLine")
+	                        promise.resolve(result)
+	                        return@Thread
+	                    }
+
+	                    Log.w(
+	                            "HealthCheck",
+	                            "⚠️ HTTP CONNECT probe returned $statusCode, falling back to legacy HTTP GET check. " +
+	                                    (statusLine ?: "")
+	                    )
+	                } catch (e: Exception) {
+	                    Log.w(
+	                            "HealthCheck",
+	                            "⚠️ HTTP CONNECT probe failed (${e.javaClass.simpleName}), falling back to legacy HTTP GET check: ${e.message}"
+	                    )
+	                } finally {
+	                    try {
+	                        probeSocket.close()
+	                    } catch (_: Exception) {}
+	                }
+	            }
+
+	            val socket = java.net.Socket()
+
+	            // Set timeouts for health check (5 seconds)
+	            socket.soTimeout = 5_000
+	            
+	            // Choose handler based on type
+	            // For HTTP: connectHttpQuick sends GET request directly through proxy
+	            // For SOCKS5: connectSocks5Quick establishes tunnel, then we send GET request
             val connected = if (isHttp) {
                 connectHttpQuick(socket, host, port, 
                     if (username.isBlank()) null else username.trim(), 
@@ -993,10 +1056,10 @@ fun checkProxyHealth(
             promise.resolve(result)
         }
     }.start()
-}
-
+	}
+	
 // Quick SOCKS5 connect with 3s timeout for health checks
-private fun connectSocks5Quick(socket: java.net.Socket, host: String, port: Int, username: String?, password: String?): Boolean {
+	private fun connectSocks5Quick(socket: java.net.Socket, host: String, port: Int, username: String?, password: String?): Boolean {
     try {
         socket.connect(java.net.InetSocketAddress(host, port), 3_000)
         if (!socket.isConnected) return false
@@ -1060,47 +1123,102 @@ private fun connectSocks5Quick(socket: java.net.Socket, host: String, port: Int,
     } catch (e: Exception) {
         return false
     }
-}
+	}
+	
+	// Quick HTTP proxy check with 3s timeout for health checks
+	// For HTTP proxies, we send the full URL in the GET request (not CONNECT tunnel)
+	// This matches: curl http://ip-api.com/json --proxy http://host:port
+	private fun connectHttpQuick(socket: java.net.Socket, host: String, port: Int, username: String?, password: String?): Boolean {
+	    try {
+	        socket.connect(java.net.InetSocketAddress(host, port), 3_000)
+	        if (!socket.isConnected) return false
+	        
+	        val output = socket.getOutputStream()
+	        
+	        // For HTTP proxy, send GET request with FULL URL (absolute URI)
+	        // The proxy will forward the request to the target server
+	        val request = StringBuilder()
+	        request.append("GET http://ip-api.com/json HTTP/1.1\r\n")
+	        request.append("Host: ip-api.com\r\n")
+	        request.append("User-Agent: ProxyHealthCheck/1.0\r\n")
+	        request.append("Connection: close\r\n")
+	        
+	        if (!username.isNullOrEmpty() && !password.isNullOrEmpty()) {
+	            val credentials = "$username:$password"
+	            val encoded = android.util.Base64.encodeToString(credentials.toByteArray(), android.util.Base64.NO_WRAP)
+	            request.append("Proxy-Authorization: Basic $encoded\r\n")
+	        }
+	        request.append("\r\n")
+	        
+	        output.write(request.toString().toByteArray())
+	        output.flush()
+	        
+	        // Don't read response here - that's done in checkProxyHealth
+	        // Just return true since connection + request succeeded
+	        return true
+	    } catch (e: Exception) {
+	        return false
+	    }
+	}
 
-// Quick HTTP proxy check with 3s timeout for health checks
-// For HTTP proxies, we send the full URL in the GET request (not CONNECT tunnel)
-// This matches: curl http://ip-api.com/json --proxy http://host:port
-private fun connectHttpQuick(socket: java.net.Socket, host: String, port: Int, username: String?, password: String?): Boolean {
-    try {
-        socket.connect(java.net.InetSocketAddress(host, port), 3_000)
-        if (!socket.isConnected) return false
-        
-        val output = socket.getOutputStream()
-        
-        // For HTTP proxy, send GET request with FULL URL (absolute URI)
-        // The proxy will forward the request to the target server
-        val request = StringBuilder()
-        request.append("GET http://ip-api.com/json HTTP/1.1\r\n")
-        request.append("Host: ip-api.com\r\n")
-        request.append("User-Agent: ProxyHealthCheck/1.0\r\n")
-        request.append("Connection: close\r\n")
-        
-        if (!username.isNullOrEmpty() && !password.isNullOrEmpty()) {
-            val credentials = "$username:$password"
-            val encoded = android.util.Base64.encodeToString(credentials.toByteArray(), android.util.Base64.NO_WRAP)
-            request.append("Proxy-Authorization: Basic $encoded\r\n")
-        }
-        request.append("\r\n")
-        
-        output.write(request.toString().toByteArray())
-        output.flush()
-        
-        // Don't read response here - that's done in checkProxyHealth
-        // Just return true since connection + request succeeded
-        return true
-    } catch (e: Exception) {
-        return false
-    }
-}
+	private fun connectHttpConnectProbe(
+	    socket: java.net.Socket,
+	    proxyHost: String,
+	    proxyPort: Int,
+	    username: String?,
+	    password: String?,
+	    targetHost: String,
+	    targetPort: Int
+	): Pair<Int, String?> {
+	    socket.connect(java.net.InetSocketAddress(proxyHost, proxyPort), 3_000)
+	    if (!socket.isConnected) return Pair(0, "Proxy socket not connected")
 
-    @ReactMethod
-    fun setPowerProfile(profile: String, promise: Promise) {
-        try {
+	    val output = socket.getOutputStream()
+	    val request = StringBuilder()
+	    request.append("CONNECT $targetHost:$targetPort HTTP/1.1\r\n")
+	    request.append("Host: $targetHost:$targetPort\r\n")
+	    request.append("User-Agent: ProxyHealthCheck/1.0\r\n")
+	    request.append("Proxy-Connection: Keep-Alive\r\n")
+
+	    if (!username.isNullOrEmpty() && !password.isNullOrEmpty()) {
+	        val credentials = "$username:$password"
+	        val encoded =
+	                android.util.Base64.encodeToString(
+	                        credentials.toByteArray(),
+	                        android.util.Base64.NO_WRAP
+	                )
+	        request.append("Proxy-Authorization: Basic $encoded\r\n")
+	    }
+	    request.append("\r\n")
+
+	    output.write(request.toString().toByteArray(Charsets.UTF_8))
+	    output.flush()
+
+	    val reader =
+	            java.io.BufferedReader(
+	                    java.io.InputStreamReader(socket.getInputStream(), Charsets.UTF_8)
+	            )
+	    val statusLine = reader.readLine()
+	    if (statusLine.isNullOrEmpty()) return Pair(0, "Empty proxy response")
+
+	    // Consume headers to reach end-of-headers (avoid leaving unread data for future reads).
+	    try {
+	        while (true) {
+	            val line = reader.readLine() ?: break
+	            if (line.isEmpty()) break
+	        }
+	    } catch (_: java.net.SocketTimeoutException) {
+	        // Best-effort: status line is already read.
+	    }
+
+	    val parts = statusLine.split(" ")
+	    val statusCode = if (parts.size >= 2) parts[1].toIntOrNull() ?: 0 else 0
+	    return Pair(statusCode, statusLine)
+	}
+	
+	    @ReactMethod
+	    fun setPowerProfile(profile: String, promise: Promise) {
+	        try {
             val validProfiles = listOf("performance", "balanced", "battery_saver")
             if (profile !in validProfiles) {
                 promise.reject("INVALID_PROFILE", "Invalid power profile: $profile")

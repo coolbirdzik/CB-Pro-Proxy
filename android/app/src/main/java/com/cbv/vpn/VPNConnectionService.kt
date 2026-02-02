@@ -52,6 +52,9 @@ class VPNConnectionService : VpnService() {
 
     // Health check mechanism for always-on VPN
     private var healthCheckThread: Thread? = null
+    // This is used as a liveness signal for the VPN loop thread.
+    // It is updated continuously while the VPN loop is running (even when idle),
+    // so that "always connect" does not get treated as dead just because the device is idle.
     private var lastPacketTime: Long = 0L
     
     // Power profile configuration (loaded from SharedPreferences)
@@ -60,7 +63,51 @@ class VPNConnectionService : VpnService() {
     private var publicIpCheckIntervalMs: Long = 180000L
     private var maxSleepMs: Long = 50L
     private var statusBroadcastPacketInterval: Int = 1000
-    private val CONNECTION_TIMEOUT_MS = 600000L // Consider dead after 10 minutes
+    private fun getVpnLoopStallTimeoutMs(): Long {
+        // Detect a stuck/crashed VPN loop reasonably quickly, while still respecting the user's
+        // power profile (which controls how often we run the health check).
+        // - performance (15s): ~35s
+        // - balanced (60s): ~125s
+        // - battery_saver (120s): ~245s
+        return (healthCheckIntervalMs * 2 + 5000L).coerceAtLeast(30000L)
+    }
+
+    private fun persistLastProxyConfig() {
+        try {
+            val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
+            prefs.edit()
+                    .putString("last_proxy_server", proxyServer)
+                    .putString("last_proxy_server_ip", proxyServerIP)
+                    .putInt("last_proxy_port", proxyPort)
+                    .putString("last_proxy_type", proxyType)
+                    .putString("last_proxy_username", proxyUsername)
+                    .putString("last_proxy_password", proxyPassword)
+                    .putLong("last_proxy_saved_at", System.currentTimeMillis())
+                    .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "⚠️ Failed to persist last proxy config: ${e.message}")
+        }
+    }
+
+    private fun tryLoadLastProxyConfig(): Boolean {
+        return try {
+            val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
+            val server = prefs.getString("last_proxy_server", null) ?: return false
+            val port = prefs.getInt("last_proxy_port", 0)
+            if (server.isBlank() || port <= 0) return false
+
+            proxyServer = server
+            proxyServerIP = prefs.getString("last_proxy_server_ip", server) ?: server
+            proxyPort = port
+            proxyType = prefs.getString("last_proxy_type", "socks5") ?: "socks5"
+            proxyUsername = prefs.getString("last_proxy_username", "") ?: ""
+            proxyPassword = prefs.getString("last_proxy_password", "") ?: ""
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "⚠️ Failed to load last proxy config: ${e.message}")
+            false
+        }
+    }
 
     // Proxy error tracking
     private var isProxyError = false
@@ -223,7 +270,10 @@ class VPNConnectionService : VpnService() {
                 return START_NOT_STICKY
             }
             if (action == COMMAND_STATUS) {
-                val currentStatus = if (isRunning) STATUS_CONNECTED else STATUS_DISCONNECTED
+                val currentStatus =
+                        if (isRunning && isProxyError) STATUS_PROXY_ERROR
+                        else if (isRunning) STATUS_CONNECTED
+                        else STATUS_DISCONNECTED
                 broadcastStatus(currentStatus, force = true)
                 return START_NOT_STICKY
             }
@@ -269,6 +319,19 @@ class VPNConnectionService : VpnService() {
             Log.d(TAG, "Starting VPN with proxy: $proxyType://$proxyServer:$proxyPort")
 
             if (proxyServer.isEmpty() || proxyPort <= 0) {
+                val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
+                val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
+                val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
+
+                if (autoConnectEnabled && !manuallyDisconnected && tryLoadLastProxyConfig()) {
+                    Log.w(
+                            TAG,
+                            "⚠️ Received invalid proxy config, falling back to last saved proxy: $proxyType://$proxyServer:$proxyPort"
+                    )
+                    startVPN()
+                    return START_STICKY
+                }
+
                 val err = "Invalid proxy configuration"
                 Log.e(TAG, "❌ $err: server='$proxyServer' port=$proxyPort")
                 broadcastStatus(STATUS_DISCONNECTED, force = true, error = err)
@@ -276,24 +339,29 @@ class VPNConnectionService : VpnService() {
                 return START_NOT_STICKY
             }
 
+            // Persist the last working proxy config so "always connect" can recover even if the app
+            // process is killed and the service is restarted without profile list context.
+            persistLastProxyConfig()
+
             startVPN()
         } else {
             // Service restarted by system - check if auto-reconnect is enabled
             Log.d(TAG, "🔄 Service restarted by system, checking auto-reconnect...")
 
-            if (!isRunning) {
-                val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
-                val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
+	            if (!isRunning) {
+	                val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
+	                val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
+	                val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
 
-                if (autoConnectEnabled) {
-                    Log.d(TAG, "✅ Auto-reconnect enabled, attempting to reconnect...")
+	                if (autoConnectEnabled && !manuallyDisconnected) {
+	                    Log.d(TAG, "✅ Auto-reconnect enabled, attempting to reconnect...")
 
-                    val lastProfileId = prefs.getString("last_connected_profile_id", null)
-                    if (lastProfileId != null) {
-                        Log.d(TAG, "📋 Reconnecting to last profile: $lastProfileId")
+	                    val lastProfileId = prefs.getString("last_connected_profile_id", null)
+	                    if (lastProfileId != null) {
+	                        Log.d(TAG, "📋 Reconnecting to last profile: $lastProfileId")
 
-                        // Load profile and reconnect
-                        try {
+	                        // Load profile and reconnect
+	                        try {
                             val profilesStr = prefs.getString("profiles", "[]")
                             val profiles = org.json.JSONArray(profilesStr ?: "[]")
 
@@ -315,16 +383,33 @@ class VPNConnectionService : VpnService() {
                                     break
                                 }
                             }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "❌ Error during auto-reconnect: ${e.message}", e)
-                        }
-                    } else {
-                        Log.d(TAG, "⚠️ No last connected profile for auto-reconnect")
-                    }
-                } else {
-                    Log.d(TAG, "⏭️ Auto-reconnect disabled")
-                }
-            }
+	                        } catch (e: Exception) {
+	                            Log.e(TAG, "❌ Error during auto-reconnect: ${e.message}", e)
+	                        }
+	                    } else {
+	                        Log.d(TAG, "⚠️ No last profile ID available for auto-reconnect")
+	                    }
+
+	                    // If the profile list is not available (or does not contain the last ID),
+	                    // fall back to the last saved proxy config.
+	                    if (!isRunning) {
+                        if (tryLoadLastProxyConfig()) {
+                            Log.d(
+                                    TAG,
+                                    "🔁 Auto-reconnect fallback: restarting with last saved proxy: $proxyType://$proxyServer:$proxyPort"
+                            )
+                            startVPN()
+	                        } else {
+	                            Log.w(TAG, "⚠️ Auto-reconnect fallback failed: no saved proxy config")
+	                        }
+	                    }
+	                } else {
+	                    Log.d(
+	                            TAG,
+	                            "⏭️ Auto-reconnect disabled or manually disconnected (autoConnect=$autoConnectEnabled, manual=$manuallyDisconnected)"
+	                    )
+	                }
+	            }
         }
         return START_STICKY
     }
@@ -441,12 +526,15 @@ class VPNConnectionService : VpnService() {
 
             while (isRunning) {
                 try {
+                    // Update liveness timer even when the device is idle (no packets).
+                    lastPacketTime = System.currentTimeMillis()
+
                     val length = inputStream.read(buffer)
                     if (length > 0) {
                         emptyReadCount = 0 // Reset empty read counter
                         packetCount++
                         bytesUp += length
-                        lastPacketTime = System.currentTimeMillis() // Update health check timer
+                        lastPacketTime = System.currentTimeMillis() // Also update on traffic
 
                         // Check if packet has TUN header (4 bytes: flags + protocol)
                         var offset = 0
@@ -555,15 +643,23 @@ class VPNConnectionService : VpnService() {
                     if (!isRunning) break
                     
                     healthCheckCycle++
-                    val timeSinceLastPacket = System.currentTimeMillis() - lastPacketTime
+                    val timeSinceLastLoop = System.currentTimeMillis() - lastPacketTime
+                    val stallTimeoutMs = getVpnLoopStallTimeoutMs()
+                    val vpnLoopAlive = vpnThread?.isAlive == true && vpnInterface != null
                     
                     // Battery optimized: only log health check when potentially concerning
-                    if (timeSinceLastPacket > CONNECTION_TIMEOUT_MS / 2) {
-                        Log.d(TAG, "🏥 Health check #$healthCheckCycle: ${timeSinceLastPacket}ms since last packet (threshold: ${CONNECTION_TIMEOUT_MS}ms)")
+                    if (!vpnLoopAlive || timeSinceLastLoop > stallTimeoutMs / 2) {
+                        Log.d(
+                                TAG,
+                                "🏥 Health check #$healthCheckCycle: vpnLoopAlive=$vpnLoopAlive, ${timeSinceLastLoop}ms since last loop activity (threshold: ${stallTimeoutMs}ms)"
+                        )
                     }
                     
-                    if (timeSinceLastPacket > CONNECTION_TIMEOUT_MS) {
-                        Log.w(TAG, "⚠️ VPN connection appears dead (no packets for ${timeSinceLastPacket}ms)")
+                    if (!vpnLoopAlive || timeSinceLastLoop > stallTimeoutMs) {
+                        Log.w(
+                                TAG,
+                                "⚠️ VPN loop appears dead/stuck (vpnLoopAlive=$vpnLoopAlive, ${timeSinceLastLoop}ms since last loop activity)"
+                        )
                         
                         // Check if auto-reconnect is enabled
                         val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
@@ -1014,9 +1110,9 @@ class VPNConnectionService : VpnService() {
             Log.d(TAG, "📡 Response from $targetHost: ${body.trim()}")
 
             val json = JSONObject(body.trim())
-            val ip = json.optString("ip", null)
+            val ip = json.optString("ip", "").trim()
 
-            if (!ip.isNullOrEmpty()) {
+            if (ip.isNotEmpty()) {
                 Log.d(TAG, "📡 Public IP via proxy: $ip")
                 return ip
             }
