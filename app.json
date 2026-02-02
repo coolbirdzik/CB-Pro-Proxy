@@ -35,7 +35,6 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "INTERNET",
-        "BIND_VPN_SERVICE",
         "CAMERA",
         "POST_NOTIFICATIONS"
       ]
