@@ -75,13 +75,14 @@ class VPNIntentReceiver : BroadcastReceiver() {
 
             // Stop existing VPN connection first to avoid stale tunnels
             Log.d(TAG, "🛑 Stopping any existing VPN connection...")
-            val stopIntent = Intent(context, VPNConnectionService::class.java)
-            stopIntent.putExtra("action", VPNConnectionService.COMMAND_STOP)
-            stopIntent.putExtra("force", true)
-            context.startService(stopIntent)
+            try {
+                context.stopService(Intent(context, VPNConnectionService::class.java))
+            } catch (e: Exception) {
+                Log.w(TAG, "⚠️ Failed to stop existing VPN service: ${e.message}", e)
+            }
 
             // Wait a moment for the stop to complete
-            Thread.sleep(500)
+            Thread.sleep(250)
 
             // Check notification permission on Android 13+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -670,10 +671,7 @@ class VPNIntentReceiver : BroadcastReceiver() {
             prefs.edit().putBoolean("automation_session_active", false).apply()
             Log.d(TAG, "💾 Marked VPN as manually disconnected")
 
-            val serviceIntent = Intent(context, VPNConnectionService::class.java)
-            serviceIntent.putExtra("action", "stop")
-            serviceIntent.putExtra("force", true)
-            context.startService(serviceIntent)
+            context.stopService(Intent(context, VPNConnectionService::class.java))
             Log.d(TAG, "✅ Stop VPN command sent")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error stopping VPN: ${e.message}", e)
@@ -685,7 +683,11 @@ class VPNIntentReceiver : BroadcastReceiver() {
             Log.d(TAG, "📊 Requesting VPN status...")
             val serviceIntent = Intent(context, VPNConnectionService::class.java)
             serviceIntent.putExtra("action", VPNConnectionService.COMMAND_STATUS)
-            context.startService(serviceIntent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
             Log.d(TAG, "✅ Status request sent")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error getting status: ${e.message}", e)
