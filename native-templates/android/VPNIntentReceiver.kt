@@ -3,10 +3,12 @@ package com.cbv.vpn
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.app.ActivityManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -680,16 +682,65 @@ class VPNIntentReceiver : BroadcastReceiver() {
 
     private fun handleGetStatus(context: Context) {
         try {
-            Log.d(TAG, "📊 Requesting VPN status...")
+            Log.d(TAG, "Requesting VPN status...")
             val serviceIntent = Intent(context, VPNConnectionService::class.java)
             serviceIntent.putExtra("action", VPNConnectionService.COMMAND_STATUS)
             context.startService(serviceIntent)
-            Log.d(TAG, "✅ Status request sent")
+
+            // Return immediate status for ADB callers:
+            // - resultCode: 1 = connected, 0 = disconnected
+            // - resultData: human-readable summary
+            val vpnTransportActive = isVpnTransportActive(context)
+            val serviceRunning = isVpnServiceRunning(context)
+            val summary =
+                    "connected=$vpnTransportActive serviceRunning=$serviceRunning"
+
+            setResultCode(if (vpnTransportActive) 1 else 0)
+            setResultData(summary)
+            setResultExtras(
+                    Bundle().apply {
+                        putBoolean("connected", vpnTransportActive)
+                        putBoolean("service_running", serviceRunning)
+                        putString("status", if (vpnTransportActive) "connected" else "disconnected")
+                    }
+            )
+
+            Log.d(TAG, "Status request sent ($summary)")
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error getting status: ${e.message}", e)
+            Log.e(TAG, "Error getting status: ${e.message}", e)
+            setResultCode(-1)
+            setResultData("error=${e.message}")
         }
     }
 
+    private fun isVpnTransportActive(context: Context): Boolean {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val networks = cm.allNetworks
+            for (network in networks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to check VPN transport: ${e.message}")
+            false
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isVpnServiceRunning(context: Context): Boolean {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val target = VPNConnectionService::class.java.name
+            am.getRunningServices(Int.MAX_VALUE).any { it.service.className == target }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to check VPN service state: ${e.message}")
+            false
+        }
+    }
     private fun startVPNWithProfile(context: Context, profile: JSONObject) {
         try {
             Log.d(TAG, "🚀 Starting VPN with profile: ${profile.getString("name")}")
@@ -764,3 +815,4 @@ class VPNIntentReceiver : BroadcastReceiver() {
         }
     }
 }
+
