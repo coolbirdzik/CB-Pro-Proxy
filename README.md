@@ -8,6 +8,7 @@
 [![Expo](https://img.shields.io/badge/Expo-~54.0-000020.svg)](https://expo.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue.svg)](https://www.typescriptlang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20iOS-lightgrey.svg)](https://github.com/yourusername/cbv-vpn-app)
+
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yourusername/cbv-vpn-app/pulls)
 
 **English documentation** — Vietnamese version available at [`README.vi.md`](./README.vi.md).
@@ -15,6 +16,12 @@
 CB Pro Proxy is an Expo-managed React Native application that provisions a local VPN interface and forwards traffic through SOCKS5 or HTTP proxies. Both Android and iOS implementations are production-ready with native `VpnService` (Android) and Network Extension (iOS) pipelines.
 
 ## Product Overview
+
+<p align="center">
+  <a href="https://play.google.com/store/apps/details?id=com.cbv.vpn&hl=vi">
+    <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Get it on Google Play" width="180" />
+  </a>
+</p>
 
 CB Pro Proxy revolutionizes proxy management on mobile devices by enabling seamless remote control through Android Debug Bridge (ADB). Tailored for developers, QA engineers, and automation specialists, this app allows you to create, start, and stop proxy profiles directly from your command line or scripts, making it perfect for device farming, automated testing, and CI/CD pipelines.
 
