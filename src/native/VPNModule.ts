@@ -1,4 +1,4 @@
-import { NativeModules, NativeEventEmitter } from "react-native";
+import { NativeModules, NativeEventEmitter, Platform } from "react-native";
 import type { VPNStatusInfo, VPNConnectionStats } from "../types";
 import { logger } from "../services/LoggerService";
 
@@ -30,6 +30,7 @@ type NativeVPNModuleShape = {
     dns1?: string,
     dns2?: string
   ): Promise<void>;
+  resumeVPNWithProfile?: NativeVPNModuleShape["startVPNWithProfile"];
   stopVPN(force?: boolean): Promise<void>;
   getStatus(): Promise<any>;
   refreshStatus(): void;
@@ -271,7 +272,8 @@ export const VPNModule = {
     username: string,
     password: string,
     dns1?: string,
-    dns2?: string
+    dns2?: string,
+    automatic = false
   ) => {
     try {
       logger.info("Starting VPN with profile", "vpn", {
@@ -286,7 +288,11 @@ export const VPNModule = {
       logger.info(`Connecting to proxy: ${name} (${host}:${port})`, "vpn");
 
       const startTime = Date.now();
-      await NativeVPNModule.startVPNWithProfile(
+      const start = automatic && Platform.OS === "android"
+        ? NativeVPNModule.resumeVPNWithProfile
+        : NativeVPNModule.startVPNWithProfile;
+      if (!start) return;
+      await start(
         name,
         host,
         port,

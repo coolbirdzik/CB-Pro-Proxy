@@ -34,9 +34,13 @@ class VPNIntentReceiver : BroadcastReceiver() {
 
         // Network reconnection debounce
         private const val RECONNECT_DELAY_MS = 3000L
-        private var lastConnectivityChangeTime = 0L
         private var reconnectHandler: Handler? = null
         private var pendingReconnectRunnable: Runnable? = null
+
+        fun cancelPendingReconnect() {
+            pendingReconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
+            pendingReconnectRunnable = null
+        }
 
         // Intent extras for ADD_PROFILE
         const val EXTRA_PROFILE_NAME = "profile_name"
@@ -59,15 +63,14 @@ class VPNIntentReceiver : BroadcastReceiver() {
         @JvmStatic
         fun startVpnService(context: Context, profile: JSONObject) {
             val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            val generation = profile.optLong(VPNConnectionPolicy.GENERATION, -1L)
+            if (!VPNConnectionPolicy.isCurrent(context, generation)) return
             val profileId = profile.getString("id")
             val proxyHost = profile.getString("host")
 
             // Stop existing VPN connection first to avoid stale tunnels
             Log.d(TAG, "🛑 Stopping any existing VPN connection...")
-            val stopIntent = Intent(context, VPNConnectionService::class.java)
-            stopIntent.putExtra("action", VPNConnectionService.COMMAND_STOP)
-            stopIntent.putExtra("force", true)
-            context.startService(stopIntent)
+            context.stopService(Intent(context, VPNConnectionService::class.java))
 
             // Wait a moment for the stop to complete
             Thread.sleep(500)
@@ -125,7 +128,9 @@ class VPNIntentReceiver : BroadcastReceiver() {
                 Log.w(TAG, "⚠️ Could not resolve hostname, using as-is: ${e.message}")
             }
 
+            if (!VPNConnectionPolicy.isCurrent(context, generation)) return
             val serviceIntent = Intent(context, VPNConnectionService::class.java)
+            serviceIntent.putExtra(VPNConnectionPolicy.GENERATION, generation)
             serviceIntent.putExtra("server", proxyHost)
             serviceIntent.putExtra("serverIP", proxyIP)
             serviceIntent.putExtra("port", profile.getInt("port"))
@@ -234,7 +239,7 @@ class VPNIntentReceiver : BroadcastReceiver() {
             val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
 
-            if (!autoConnectEnabled) {
+            if (!VPNConnectionPolicy.canRecover(context)) {
                 Log.d(TAG, "⏭️ Auto-connect is disabled, skipping")
                 return
             }
@@ -279,7 +284,7 @@ class VPNIntentReceiver : BroadcastReceiver() {
             )
 
             // Start VPN with the last connected profile
-            startVPNWithProfile(context, targetProfile)
+            startVPNWithProfile(context, targetProfile, automatic = true)
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error handling boot completed: ${e.message}", e)
         }
@@ -289,33 +294,10 @@ class VPNIntentReceiver : BroadcastReceiver() {
         try {
             Log.d(TAG, "📡 Network connectivity changed")
 
-            // Check if auto-connect is enabled
+            cancelPendingReconnect()
+            if (!VPNConnectionPolicy.canRecover(context) || isVpnTransportActive(context)) return
             val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
-
-            if (!autoConnectEnabled) {
-                Log.d(TAG, "⏭️ Auto-connect is disabled, skipping network reconnect")
-                return
-            }
-
-            // Check if VPN was manually disconnected by user
-            val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
-            if (manuallyDisconnected) {
-                Log.d(TAG, "⏭️ VPN was manually disconnected by user, skipping auto-reconnect")
-                return
-            }
-
-            // Check if network is now available
-            val connectivityManager =
-                    context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val isNetworkAvailable = isNetworkAvailable(connectivityManager)
-
-            if (!isNetworkAvailable) {
-                Log.d(TAG, "⚠️ Network is not available, skipping reconnect")
-                return
-            }
-
-            Log.d(TAG, "✅ Network is available, checking VPN status...")
+            val generation = VPNConnectionPolicy.generation(context)
 
             // Get last connected profile ID
             val lastProfileId = prefs.getString("last_connected_profile_id", null)
@@ -325,27 +307,15 @@ class VPNIntentReceiver : BroadcastReceiver() {
                 return
             }
 
-            // Debounce: Prevent rapid reconnection attempts
-            val currentTime = System.currentTimeMillis()
-            val timeSinceLastChange = currentTime - lastConnectivityChangeTime
-
-            if (timeSinceLastChange < RECONNECT_DELAY_MS) {
-                Log.d(
-                        TAG,
-                        "⏳ Debouncing network change (${timeSinceLastChange}ms since last change)"
-                )
-                // Cancel any pending reconnect
-                pendingReconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
-            }
-
-            lastConnectivityChangeTime = currentTime
-
             // Schedule reconnect with delay
             if (reconnectHandler == null) {
                 reconnectHandler = Handler(Looper.getMainLooper())
             }
 
-            pendingReconnectRunnable = Runnable {
+            val reconnect = Runnable {
+                pendingReconnectRunnable = null
+                if (!VPNConnectionPolicy.canRecover(context, generation) ||
+                        isVpnTransportActive(context)) return@Runnable
                 try {
                     Log.d(TAG, "🔄 Attempting auto-reconnect after network change...")
 
@@ -376,51 +346,17 @@ class VPNIntentReceiver : BroadcastReceiver() {
                             TAG,
                             "🚀 Auto-reconnecting VPN after network change with profile: ${targetProfile.getString("name")}"
                     )
-                    startVPNWithProfile(context, targetProfile)
+                    startVPNWithProfile(context, targetProfile, automatic = true)
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ Error during auto-reconnect: ${e.message}", e)
                 }
             }
 
-            reconnectHandler?.postDelayed(pendingReconnectRunnable!!, RECONNECT_DELAY_MS)
+            pendingReconnectRunnable = reconnect
+            reconnectHandler?.postDelayed(reconnect, RECONNECT_DELAY_MS)
             Log.d(TAG, "⏰ Scheduled VPN reconnect in ${RECONNECT_DELAY_MS}ms")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error handling connectivity change: ${e.message}", e)
-        }
-    }
-
-    private fun isNetworkAvailable(connectivityManager: ConnectivityManager): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val network = connectivityManager.activeNetwork ?: return false
-                val capabilities =
-                        connectivityManager.getNetworkCapabilities(network) ?: return false
-
-                val hasTransport =
-                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
-                                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-
-                val hasInternet =
-                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                val isValidated =
-                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-
-                Log.d(
-                        TAG,
-                        "Network status: hasTransport=$hasTransport, hasInternet=$hasInternet, isValidated=$isValidated"
-                )
-
-                hasTransport && hasInternet && isValidated
-            } else {
-                @Suppress("DEPRECATION") val networkInfo = connectivityManager.activeNetworkInfo
-                val isConnected = networkInfo?.isConnected == true
-                Log.d(TAG, "Network status (legacy): isConnected=$isConnected")
-                isConnected
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error checking network availability: ${e.message}", e)
-            false
         }
     }
 
@@ -666,14 +602,11 @@ class VPNIntentReceiver : BroadcastReceiver() {
 
             // Mark as manually disconnected to prevent auto-reconnect
             val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putBoolean("manually_disconnected", true).apply()
+            VPNConnectionPolicy.disconnect(context)
             prefs.edit().putBoolean("automation_session_active", false).apply()
             Log.d(TAG, "💾 Marked VPN as manually disconnected")
 
-            val serviceIntent = Intent(context, VPNConnectionService::class.java)
-            serviceIntent.putExtra("action", "stop")
-            serviceIntent.putExtra("force", true)
-            context.startService(serviceIntent)
+            context.stopService(Intent(context, VPNConnectionService::class.java))
             Log.d(TAG, "✅ Stop VPN command sent")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error stopping VPN: ${e.message}", e)
@@ -741,20 +674,23 @@ class VPNIntentReceiver : BroadcastReceiver() {
             false
         }
     }
-    private fun startVPNWithProfile(context: Context, profile: JSONObject) {
+    private fun startVPNWithProfile(context: Context, profile: JSONObject, automatic: Boolean = false) {
         try {
             Log.d(TAG, "🚀 Starting VPN with profile: ${profile.getString("name")}")
 
-            // Clear manually disconnected flag when starting VPN
+            // Only an explicit start can override a manual disconnect.
             val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putBoolean("manually_disconnected", false).apply()
+            if (automatic && !VPNConnectionPolicy.canRecover(context)) return
+            profile.put(VPNConnectionPolicy.GENERATION,
+                    if (automatic) VPNConnectionPolicy.generation(context)
+                    else VPNConnectionPolicy.connect(context))
             // Mark that this session was started via automation (ADB)
-            prefs.edit().putBoolean("automation_session_active", true).apply()
+            if (!automatic) prefs.edit().putBoolean("automation_session_active", true).apply()
             
             // Enable auto-connect when started via ADB/automation
             // This ensures VPN will auto-reconnect if connection drops
-            prefs.edit().putBoolean("auto_connect_enabled", true).apply()
-            Log.d(TAG, "💾 Cleared manually disconnected flag and enabled auto-connect")
+            if (!automatic) prefs.edit().putBoolean("auto_connect_enabled", true).apply()
+
 
             // Save this profile as the last connected profile
             prefs.edit().putString("last_connected_profile_id", profile.getString("id")).apply()

@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
+import android.os.Handler
+import android.os.Looper
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -33,7 +35,9 @@ class VPNConnectionService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var vpnThread: Thread? = null
-    private var isRunning = false
+    @Volatile private var isRunning = false
+    private val recoveryHandler = Handler(Looper.getMainLooper())
+    private var connectionGeneration = -1L
 
     private var proxyServer: String = ""
     private var proxyServerIP: String = ""
@@ -252,6 +256,9 @@ class VPNConnectionService : VpnService() {
             val action = intent.getStringExtra("action")
 
             if (action == COMMAND_STOP) {
+                if (intent.hasExtra(VPNConnectionPolicy.GENERATION) &&
+                        intent.getLongExtra(VPNConnectionPolicy.GENERATION, -1L) !=
+                                VPNConnectionPolicy.generation(this)) return START_NOT_STICKY
                 val force = intent.getBooleanExtra("force", false)
                 val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
                 val automationActive = prefs.getBoolean("automation_session_active", false)
@@ -264,6 +271,9 @@ class VPNConnectionService : VpnService() {
                     return START_NOT_STICKY
                 }
 
+                if (!intent.hasExtra(VPNConnectionPolicy.GENERATION) && !intent.getBooleanExtra("restart", false)) {
+                    VPNConnectionPolicy.disconnect(this)
+                }
                 // Clear automation flag when a forced stop is allowed
                 prefs.edit().putBoolean("automation_session_active", false).apply()
                 stopVPN()
@@ -275,6 +285,10 @@ class VPNConnectionService : VpnService() {
                         else if (isRunning) STATUS_CONNECTED
                         else STATUS_DISCONNECTED
                 broadcastStatus(currentStatus, force = true)
+                if (!isRunning) {
+                    stopForeground(true)
+                    stopSelf()
+                }
                 return START_NOT_STICKY
             }
             
@@ -283,8 +297,16 @@ class VPNConnectionService : VpnService() {
                 val newProfile = intent.getStringExtra("power_profile") ?: "balanced"
                 Log.d(TAG, "⚡ Power profile update requested: $newProfile")
                 loadPowerProfileConfig()
+                if (!isRunning) stopVPN()
                 return START_NOT_STICKY
             }
+            val requestedGeneration = intent.getLongExtra(VPNConnectionPolicy.GENERATION, -1L)
+            if (!VPNConnectionPolicy.isCurrent(this, requestedGeneration)) {
+                if (!isRunning) stopVPN()
+                return START_NOT_STICKY
+            }
+            recoveryHandler.removeCallbacksAndMessages(null)
+            connectionGeneration = requestedGeneration
             val nextServer = intent.getStringExtra("server") ?: ""
             val nextServerIP = intent.getStringExtra("serverIP") ?: nextServer
             val nextPort = intent.getIntExtra("port", 0)
@@ -329,7 +351,7 @@ class VPNConnectionService : VpnService() {
                             "⚠️ Received invalid proxy config, falling back to last saved proxy: $proxyType://$proxyServer:$proxyPort"
                     )
                     startVPN()
-                    return START_STICKY
+                    return if (isRunning) START_STICKY else START_NOT_STICKY
                 }
 
                 val err = "Invalid proxy configuration"
@@ -345,6 +367,7 @@ class VPNConnectionService : VpnService() {
 
             startVPN()
         } else {
+            connectionGeneration = VPNConnectionPolicy.generation(this)
             // Service restarted by system - check if auto-reconnect is enabled
             Log.d(TAG, "🔄 Service restarted by system, checking auto-reconnect...")
 
@@ -353,7 +376,7 @@ class VPNConnectionService : VpnService() {
 	                val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
 	                val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
 
-	                if (autoConnectEnabled && !manuallyDisconnected) {
+	                if (VPNConnectionPolicy.canRecover(this)) {
 	                    Log.d(TAG, "✅ Auto-reconnect enabled, attempting to reconnect...")
 
 	                    val lastProfileId = prefs.getString("last_connected_profile_id", null)
@@ -411,10 +434,19 @@ class VPNConnectionService : VpnService() {
 	                }
 	            }
         }
+        if (!isRunning) {
+            stopVPN()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
     private fun startVPN() {
+        if (!VPNConnectionPolicy.isCurrent(this, connectionGeneration) ||
+                !VPNConnectionPolicy.hasUnderlyingNetwork(this)) {
+            stopVPN()
+            return
+        }
         if (isRunning) {
             Log.w(TAG, "VPN already running")
             return
@@ -603,7 +635,7 @@ class VPNConnectionService : VpnService() {
                         val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
                         val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
                         
-                        if (autoConnectEnabled && !manuallyDisconnected) {
+                        if (VPNConnectionPolicy.canRecover(this)) {
                             Log.d(TAG, "🔄 VPN loop error but auto-reconnect enabled")
                             // Health check thread will handle reconnection
                         }
@@ -619,7 +651,7 @@ class VPNConnectionService : VpnService() {
             val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
             val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
             
-            if (autoConnectEnabled && !manuallyDisconnected) {
+            if (VPNConnectionPolicy.canRecover(this)) {
                 Log.d(TAG, "🔄 Fatal VPN error but auto-reconnect enabled")
                 // Health check thread will detect the dead connection and restart
             }
@@ -661,43 +693,19 @@ class VPNConnectionService : VpnService() {
                                 "⚠️ VPN loop appears dead/stuck (vpnLoopAlive=$vpnLoopAlive, ${timeSinceLastLoop}ms since last loop activity)"
                         )
                         
-                        // Check if auto-reconnect is enabled
-                        val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
-                        val autoConnectEnabled = prefs.getBoolean("auto_connect_enabled", false)
-                        val manuallyDisconnected = prefs.getBoolean("manually_disconnected", false)
-                        
-                        if (autoConnectEnabled && !manuallyDisconnected) {
-                            Log.d(TAG, "🔄 Auto-reconnect enabled, attempting to restart VPN...")
-                            
-                            // Save current connection details
-                            val savedServer = proxyServer
-                            val savedServerIP = proxyServerIP
-                            val savedPort = proxyPort
-                            val savedUsername = proxyUsername
-                            val savedPassword = proxyPassword
-                            val savedType = proxyType
-                            
-                            // Stop current connection
+                        val generation = connectionGeneration
+                        recoveryHandler.post {
+                            if (!VPNConnectionPolicy.isCurrent(this, generation)) return@post
                             stopVPNInternal()
-                            
-                            // Wait a bit before reconnecting
-                            Thread.sleep(2000)
-                            
-                            // Restore connection details
-                            proxyServer = savedServer
-                            proxyServerIP = savedServerIP
-                            proxyPort = savedPort
-                            proxyUsername = savedUsername
-                            proxyPassword = savedPassword
-                            proxyType = savedType
-                            
-                            // Restart VPN
-                            Log.d(TAG, "🚀 Restarting VPN connection to $proxyServer:$proxyPort")
-                            startVPN()
-                        } else {
-                            Log.d(TAG, "⏭️ Auto-reconnect disabled or manually disconnected, stopping VPN")
-                            stopVPNInternal()
-                            stopSelf()
+                            if (!VPNConnectionPolicy.canRecover(this, generation)) {
+                                stopVPN()
+                                return@post
+                            }
+                            recoveryHandler.postDelayed({
+                                if (!VPNConnectionPolicy.isCurrent(this, generation)) return@postDelayed
+                                if (VPNConnectionPolicy.canRecover(this, generation)) startVPN()
+                                else stopVPN()
+                            }, 2000L)
                         }
                         break
                     }
@@ -713,6 +721,7 @@ class VPNConnectionService : VpnService() {
     }
 
     private fun stopVPNInternal() {
+        recoveryHandler.removeCallbacksAndMessages(null)
         Log.d(TAG, "🛑 Stopping VPN internal...")
         isRunning = false
 
@@ -951,7 +960,7 @@ class VPNConnectionService : VpnService() {
         
         val intent = packageManager.getLaunchIntentForPackage(packageName)
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
@@ -1222,7 +1231,7 @@ class VPNConnectionService : VpnService() {
         
         // Use FLAG_IMMUTABLE on Android 12+ (required), FLAG_UPDATE_CURRENT on older versions
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
@@ -1232,6 +1241,7 @@ class VPNConnectionService : VpnService() {
         // Create stop intent
         val stopIntent = Intent(this, VPNConnectionService::class.java)
         stopIntent.putExtra("action", COMMAND_STOP)
+        stopIntent.putExtra("force", true)
         val stopPendingIntent =
                 PendingIntent.getService(
                         this,
@@ -1308,7 +1318,7 @@ class VPNConnectionService : VpnService() {
         
         // Mark as manually disconnected since user revoked permission
         val prefs = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
-        prefs.edit().putBoolean("manually_disconnected", true).apply()
+        VPNConnectionPolicy.disconnect(this)
         
         stopVPN()
     }

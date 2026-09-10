@@ -127,7 +127,6 @@ export const useVPNEvents = () => {
           }
 
           await selectProfile(profile.id);
-          setVPNStatus("connecting");
           await VPNModule.startVPNWithProfile(
             profile.name,
             profile.host,
@@ -136,7 +135,8 @@ export const useVPNEvents = () => {
             profile.username || "",
             profile.password || "",
             profile.dns1,
-            profile.dns2
+            profile.dns2,
+            true
           );
           logInfo("Auto-connecting after profile update", undefined, {
             profileId: profile.id,
@@ -190,7 +190,8 @@ export const useVPNEvents = () => {
                 profile.username || "",
                 profile.password || "",
                 profile.dns1,
-                profile.dns2
+                profile.dns2,
+                true
               );
             }
           } catch (error) {
@@ -252,7 +253,8 @@ export const useVPNEvents = () => {
                     profile.username || "",
                     profile.password || "",
                     profile.dns1,
-                    profile.dns2
+                    profile.dns2,
+                    true
                   );
                 }
               }
@@ -386,7 +388,6 @@ export const useVPNEvents = () => {
           if (candidateHealth.status === "ok") {
             const vpnActions = useVPNStore.getState();
             await vpnActions.selectProfile(candidateWithCredentials.id);
-            vpnActions.setVPNStatus("connecting");
             await VPNModule.startVPNWithProfile(
               candidateWithCredentials.name,
               candidateWithCredentials.host,
@@ -395,7 +396,8 @@ export const useVPNEvents = () => {
               candidateWithCredentials.username || "",
               candidateWithCredentials.password || "",
               candidateWithCredentials.dns1,
-              candidateWithCredentials.dns2
+              candidateWithCredentials.dns2,
+              true
             );
             lastAutoSwitchAtRef.current = Date.now();
             logWarn("Auto-switched to healthy proxy", undefined, {

@@ -329,6 +329,7 @@ class VPNModule(reactContext: ReactApplicationContext) :
                 return
             }
 
+            profile.put(VPNConnectionPolicy.GENERATION, VPNConnectionPolicy.connect(reactApplicationContext))
             Log.d(TAG, "📋 Profile details:")
             Log.d(TAG, "  - Name: ${profile.optString("name", "Unknown")}")
             Log.d(TAG, "  - Host: ${profile.getString("host")}")
@@ -370,13 +371,12 @@ class VPNModule(reactContext: ReactApplicationContext) :
             // Save this profile as the last connected profile for auto-connect
             setLastConnectedProfileId(profileId)
 
-            // Clear manually disconnected flag when starting VPN
+            // Preserve the intent recorded before requesting permission.
             val prefs =
                     reactApplicationContext.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putBoolean("manually_disconnected", false).apply()
             // Mark automation session as false when started from UI/React
             prefs.edit().putBoolean("automation_session_active", false).apply()
-            Log.d(TAG, "💾 Cleared manually disconnected flag")
+
 
             startVPNService(profile)
             lastDuration = 0L
@@ -410,6 +410,36 @@ class VPNModule(reactContext: ReactApplicationContext) :
             dns2: String?,
             promise: Promise
     ) {
+        startProfile(name, host, port, type, username, password, dns1, dns2, false, promise)
+    }
+
+    @ReactMethod
+    fun resumeVPNWithProfile(
+            name: String,
+            host: String,
+            port: Int,
+            type: String,
+            username: String,
+            password: String,
+            dns1: String?,
+            dns2: String?,
+            promise: Promise
+    ) {
+        startProfile(name, host, port, type, username, password, dns1, dns2, true, promise)
+    }
+
+    private fun startProfile(
+            name: String,
+            host: String,
+            port: Int,
+            type: String,
+            username: String,
+            password: String,
+            dns1: String?,
+            dns2: String?,
+            automatic: Boolean,
+            promise: Promise
+    ) {
         try {
             Log.d(TAG, "========================================")
             Log.d(TAG, "🚀 startVPNWithProfile() called from React Native")
@@ -425,6 +455,14 @@ class VPNModule(reactContext: ReactApplicationContext) :
             profile.put("password", password)
             profile.put("dns1", dns1 ?: "1.1.1.1")
             profile.put("dns2", dns2 ?: "8.8.8.8")
+            val context = reactApplicationContext
+            if (automatic && (!VPNConnectionPolicy.isCurrent(context, VPNConnectionPolicy.generation(context)) ||
+                    !VPNConnectionPolicy.hasUnderlyingNetwork(context))) {
+                promise.resolve(null)
+                return
+            }
+            profile.put(VPNConnectionPolicy.GENERATION,
+                    if (automatic) VPNConnectionPolicy.generation(context) else VPNConnectionPolicy.connect(context))
 
             Log.d(TAG, "📋 Profile details:")
             Log.d(TAG, "  - Name: $name")
@@ -461,12 +499,11 @@ class VPNModule(reactContext: ReactApplicationContext) :
 
             Log.d(TAG, "🚀 Starting VPN service with profile: $name")
 
-            // Clear manually disconnected flag when starting VPN
+            // Preserve the intent recorded before requesting permission.
             val prefs =
                     reactApplicationContext.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putBoolean("manually_disconnected", false).apply()
             prefs.edit().putBoolean("automation_session_active", false).apply()
-            Log.d(TAG, "💾 Cleared manually disconnected flag")
+
 
             startVPNService(profile)
             lastDuration = 0L
@@ -496,7 +533,10 @@ class VPNModule(reactContext: ReactApplicationContext) :
                     reactApplicationContext.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             // Only mark manual disconnect when explicitly forced (user/UI or STOP intent)
             if (force) {
-                prefs.edit().putBoolean("manually_disconnected", true).apply()
+                VPNConnectionPolicy.disconnect(reactApplicationContext)
+                pendingVPNPromise?.reject("VPN_CANCELLED", "Connection cancelled by user")
+                pendingVPNPromise = null
+                pendingProfile = null
                 prefs.edit().putBoolean("automation_session_active", false).apply()
                 Log.d(TAG, "💾 Marked VPN as manually disconnected (force=$force)")
             } else {
@@ -511,6 +551,7 @@ class VPNModule(reactContext: ReactApplicationContext) :
             val intent = Intent(reactApplicationContext, VPNConnectionService::class.java)
             intent.putExtra("action", "stop")
             intent.putExtra("force", force)
+            intent.putExtra(VPNConnectionPolicy.GENERATION, VPNConnectionPolicy.generation(reactApplicationContext))
             reactApplicationContext.startService(intent)
 
             isConnected = false
@@ -568,6 +609,8 @@ class VPNModule(reactContext: ReactApplicationContext) :
     @ReactMethod fun removeListeners(count: Int) {}
 
     private fun startVPNService(profile: JSONObject) {
+        val generation = profile.optLong(VPNConnectionPolicy.GENERATION, -1L)
+        check(VPNConnectionPolicy.isCurrent(reactApplicationContext, generation)) { "Connection cancelled" }
         Log.d(TAG, "========================================")
         Log.d(TAG, "🔧 startVPNService() called")
         Log.d(TAG, "========================================")
@@ -585,6 +628,8 @@ class VPNModule(reactContext: ReactApplicationContext) :
             Log.w(TAG, "⚠️ Could not resolve hostname, using as-is: ${e.message}")
         }
 
+        check(VPNConnectionPolicy.isCurrent(reactApplicationContext, generation)) { "Connection cancelled" }
+        intent.putExtra(VPNConnectionPolicy.GENERATION, generation)
         intent.putExtra("server", proxyHost)
         intent.putExtra("serverIP", proxyIP)
         intent.putExtra("port", profile.getInt("port"))

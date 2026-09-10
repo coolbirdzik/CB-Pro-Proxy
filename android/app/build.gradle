@@ -132,6 +132,10 @@ android {
             useLegacyPackaging enableLegacyPackaging.toBoolean()
         }
     }
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
+
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
     }
@@ -158,6 +162,8 @@ android {
 }
 
 dependencies {
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.robolectric:robolectric:4.14.1"
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 

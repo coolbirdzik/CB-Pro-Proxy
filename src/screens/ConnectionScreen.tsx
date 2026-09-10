@@ -64,6 +64,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
   });
 
   const [isConnectingLocal, setIsConnectingLocal] = useState(false);
+  const connectionAttemptRef = useRef(0);
   const [isSpeedTesting, setIsSpeedTesting] = useState(false);
   const [speedTestResult, setSpeedTestResult] = useState<{
     downBps: number;
@@ -147,6 +148,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
   const connectionState = useMemo(() => {
     const status = vpnStatus;
     if (status === "connected") return "connected";
+    if (status === "proxy_error") return "proxy_error";
     if (status === "handshaking") return "handshaking";
     if (status === "connecting" || isConnectingLocal) return "connecting";
     if (status === "error") return "error";
@@ -159,12 +161,14 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
   const canConnect =
     (connectionState === "disconnected" || connectionState === "error") &&
     !!activeProfile;
-  const canDisconnect = isConnected || isConnecting;
+  const canDisconnect = isConnected || isConnecting || connectionState === "proxy_error";
 
   const connectButtonLabel = useMemo(() => {
     switch (connectionState) {
       case "connected":
         return "Connected";
+      case "proxy_error":
+        return "Proxy Error";
       case "handshaking":
         return "Handshaking";
       case "connecting":
@@ -181,6 +185,8 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
     switch (connectionState) {
       case "connected":
         return ipAddress ? `IP: ${ipAddress}` : "Tunnel is active";
+      case "proxy_error":
+        return "Tap to disconnect";
       case "handshaking":
         return "Negotiating secure tunnel";
       case "connecting":
@@ -222,6 +228,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
           textColor: colors.text.inverse,
           subtitleColor: colors.text.inverse,
         };
+      case "proxy_error":
       case "error":
         return {
           backgroundColor: colors.vpn.error,
@@ -547,6 +554,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
       return;
     }
 
+    const attempt = ++connectionAttemptRef.current;
     setIsConnectingLocal(true);
     setVPNStatus("connecting");
 
@@ -619,6 +627,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
         (await storageService.getProfileWithCredentials(activeProfile.id)) ||
         activeProfile;
 
+      if (attempt !== connectionAttemptRef.current) return;
       await VPNModule.startVPNWithProfile(
         refreshedProfile.name,
         refreshedProfile.host,
@@ -635,6 +644,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
         await new Promise((resolve) => setTimeout(resolve, 2000));
 
         const status = await VPNModule.getStatus();
+        if (attempt !== connectionAttemptRef.current) return;
         const state = status?.state || "disconnected";
 
         console.log("🔍 iOS VPN status after start:", state);
@@ -664,6 +674,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
       }
       console.log("✅ VPN started successfully");
     } catch (error: any) {
+      if (attempt !== connectionAttemptRef.current) return;
       let errorMsg = "Unknown error";
       if (typeof error === "string") {
         errorMsg = error;
@@ -694,6 +705,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
   };
 
   const handleDisconnect = async () => {
+    connectionAttemptRef.current += 1;
     try {
       setIsConnectingLocal(false);
       await VPNModule.stopVPN(true);
@@ -867,7 +879,7 @@ export const ConnectionScreen: React.FC<ConnectionScreenProps> = ({
               !canConnect && !canDisconnect && styles.connectButtonDisabled,
             ]}
             onPress={
-              isConnected || isConnecting ? handleDisconnect : handleConnect
+              canDisconnect ? handleDisconnect : handleConnect
             }
             disabled={!canConnect && !canDisconnect}
             activeOpacity={0.92}
